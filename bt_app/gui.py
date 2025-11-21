@@ -483,6 +483,14 @@ class App(ctk.CTk):
         self.preview_ctkimg = None
         self.product_map = {}
 
+        # состояние текущего пакета
+        self.batch_info = None
+        self.batch_action_var = ctk.StringVar(value="")
+        self.batch_info_var = ctk.StringVar(value="")
+        self.batch_details_var = ctk.StringVar(value="")
+        self.batch_partial_var = ctk.StringVar(value="")
+        self._batch_panel_visible = False
+
         self._build_ui()
         self._start_bt()
         self._refresh_printers()
@@ -501,13 +509,196 @@ class App(ctk.CTk):
                 frac = max(0.0, min(1.0, cur / total))
                 self.progress_bar.set(frac)
                 self.progress_label.configure(text=f"{phase} {cur}/{total}")
-            self.update_idletasks()
-            try:
-                self.update()
-            except Exception:
-                pass
+                self.update_idletasks()
+                try:
+                    self.update()
+                except Exception:
+                    pass
         except Exception:
             pass
+
+    # ---------- batch workflow helpers ----------
+
+    def _hide_batch_controls(self):
+        try:
+            self.batch_panel.pack_forget()
+            self._batch_panel_visible = False
+        except Exception:
+            pass
+
+    def _show_batch_controls(self, info_text: str, detail_text: str):
+        self.batch_info_var.set(info_text)
+        self.batch_details_var.set(detail_text)
+        try:
+            if not self._batch_panel_visible:
+                self.batch_panel.pack(fill="x", padx=12, pady=(0, 8))
+                self._batch_panel_visible = True
+        except Exception:
+            pass
+
+    def _reset_batch_state(self):
+        self.batch_info = None
+        self.batch_partial_var.set("")
+        self.batch_action_var.set("")
+        self.batch_info_var.set("Управление пакетом появится после первой отправки")
+        self.batch_details_var.set("")
+        self._hide_batch_controls()
+
+    def _on_batch_action(self, action: str):
+        if action == "partial":
+            val = (self.batch_partial_var.get() or "").strip()
+            if not val:
+                mb.showerror("Допечатка", "Введите номер ярлыка внутри пакета, с которого продолжать печать.")
+                return
+            try:
+                start_idx = int(val)
+                if start_idx < 1:
+                    raise ValueError
+            except Exception:
+                mb.showerror("Допечатка", "Нужно ввести целое число 1 или больше.")
+                return
+            if not self.batch_info:
+                mb.showerror("Допечатка", "Нет данных текущего пакета.")
+                return
+            if start_idx > len(self.batch_info.get("rows", [])):
+                mb.showerror("Допечатка", "Стартовый индекс превышает размер пакета.")
+                return
+            self.batch_info["partial_start"] = start_idx
+        self.batch_action_var.set(action)
+
+    def _await_batch_action(self) -> str:
+        self.batch_action_var.set("")
+        try:
+            self.wait_variable(self.batch_action_var)
+        except Exception:
+            return "next"
+        return self.batch_action_var.get() or "next"
+
+    def _store_batch_state(self, bidx: int, total_batches: int, rows, enriched_rows, global_offset: int, copies: int, printer: str):
+        self.batch_info = {
+            "index": bidx,
+            "total": total_batches,
+            "rows": list(rows),
+            "enriched_rows": list(enriched_rows),
+            "offset": global_offset,
+            "copies": copies,
+            "printer": printer,
+        }
+
+    def _prepare_enriched_rows(self, rows, global_offset: int):
+        enriched_rows = []
+        for i_pre, base_pre in enumerate(rows):
+            self._pause_wait()
+            try:
+                self.update_idletasks(); self.update()
+            except Exception:
+                pass
+            idx1_pre = global_offset + i_pre + 1
+            enr_pre = self._enrich(base_pre, idx1_pre)
+            if not enr_pre:
+                self.logger.err(f"Строка {idx1_pre}: данные не сформированы — пропуск в буфере")
+                continue
+            enriched_rows.append(enr_pre)
+        try:
+            if bool(self.calib_var.get()) and enriched_rows:
+                cols = getattr(self, 'REQ_COLS', ["ShortName","ShortGTIN","EXP_DATE","PROD_DATE","PART_NUM","DM","NUM"])
+                fmt0 = (enriched_rows[0].get("_FORMAT") or "16x16")
+                dummy = {k: ("1" if k.upper()=="NUM" else ("000" if k=="ShortGTIN" else "X")) for k in cols}
+                dummy.update({"_FORMAT": fmt0})
+                enriched_rows = [dummy.copy() for _ in range(6)] + enriched_rows
+                self.logger.log("КАЛИБРОВКА: 6 строк 'X' добавлены в начало батча.")
+        except Exception:
+            pass
+        return enriched_rows
+
+    def _print_enriched_rows(self, enriched_rows, prn: str, copies: int, bidx: int, total_batches: int) -> int:
+        fmt = None
+        last_btw = None
+        sent = 0
+        prompt_left = bool(self.show_dialog_var.get())
+        calib_done = False
+        try:
+            for i_enr, enr in enumerate(enriched_rows):
+                self._pause_wait()
+                try:
+                    self.update_idletasks(); self.update()
+                except Exception:
+                    pass
+
+                fmt_name = enr.get("_FORMAT","16x16")
+                btw = self._get_btw_for_format(fmt_name)
+                if not btw:
+                    self.logger.err(f"Пакет {bidx}: BTW для формата {fmt_name} не указан — строка пропущена")
+                    self._set_progress(i_enr+1, len(enriched_rows), f"Печать пакета {bidx}")
+                    continue
+
+                if (fmt is None) or (btw != last_btw):
+                    try:
+                        if fmt:
+                            fmt.Close(1)
+                    except Exception:
+                        pass
+                    fmt = self.bt.open_format(btw)
+                    self.bt.set_common_print_flags(fmt)
+                    fmt.PrintSetup.Printer = prn
+                    last_btw = btw
+                    if not calib_done:
+                        self._maybe_calibrate(fmt, copies)
+                        calib_done = True
+
+                fmt.PrintSetup.IdenticalCopiesOfLabel = copies
+                ok = self.bt.apply_fields(fmt, enr)
+                if not ok:
+                    self.logger.err(f"Пакет {bidx}: не удалось подставить значения — строка пропущена")
+                    self._set_progress(i_enr+1, len(enriched_rows), f"Печать пакета {bidx}")
+                    continue
+                if self.cancel_requested:
+                    self.logger.log("Печать прервана пользователем.")
+                    break
+                self._bt_print(fmt, fmt.PrintSetup.IdenticalCopiesOfLabel, prompt_left)
+                prompt_left = False
+                sent += 1
+                self._set_progress(i_enr+1, len(enriched_rows), f"Печать пакета {bidx}")
+            return sent
+        except Exception as e:
+            import traceback
+            self.logger.err(f"Сбой печати пакета {bidx} (после записи tmp_batch): {e}\n{traceback.format_exc()}")
+            return sent
+        finally:
+            try:
+                if fmt:
+                    fmt.Close(1)
+            except Exception:
+                pass
+
+    def _reprint_current_batch(self):
+        if not self.batch_info:
+            mb.showerror("Печать пакета", "Нет данных текущего пакета.")
+            return
+        enriched_rows = list(self.batch_info.get("enriched_rows", []))
+        if not enriched_rows:
+            mb.showerror("Печать пакета", "Текущий пакет пуст и не может быть перепечатан.")
+            return
+        self._write_tmp_batch_csv(enriched_rows)
+        self._print_enriched_rows(enriched_rows, self.batch_info.get("printer", ""), self.batch_info.get("copies", 1), self.batch_info.get("index", 1), self.batch_info.get("total", 1))
+
+    def _reprint_partial_batch(self):
+        if not self.batch_info:
+            mb.showerror("Допечатка", "Нет данных текущего пакета.")
+            return
+        start_idx = self.batch_info.get("partial_start", 1)
+        rows = self.batch_info.get("rows", [])
+        if start_idx > len(rows):
+            mb.showerror("Допечатка", "Стартовый индекс превышает размер пакета.")
+            return
+        offset = self.batch_info.get("offset", 0) + start_idx - 1
+        part_rows = rows[start_idx - 1:]
+        enriched_rows = self._prepare_enriched_rows(part_rows, offset)
+        if not enriched_rows:
+            mb.showerror("Допечатка", "Нет валидных строк для допечатки.")
+            return
+        self._write_tmp_batch_csv(enriched_rows)
+        self._print_enriched_rows(enriched_rows, self.batch_info.get("printer", ""), self.batch_info.get("copies", 1), self.batch_info.get("index", 1), self.batch_info.get("total", 1))
 
     def _build_ui(self):
         # верхняя панель: выбор формата/шаблонов/CSV
@@ -615,6 +806,8 @@ class App(ctk.CTk):
         self.cancel_btn = ctk.CTkButton(btns, text="Отмена печати", command=self._cancel_print, height=36)
         self.cancel_btn.pack(side="left", padx=6, pady=8)
 
+        self._build_batch_panel()
+
 # прогресс
         pframe = ctk.CTkFrame(self, corner_radius=8)
         pframe.pack(fill="x", padx=12, pady=(0, 8))
@@ -666,6 +859,30 @@ class App(ctk.CTk):
         m.add_separator()
         m.add_command(label="Сохранить лог…", command=self._save_log)
         self.logbox.bind("<Button-3>", lambda e: (m.tk_popup(e.x_root, e.y_root), m.grab_release()))
+
+    def _build_batch_panel(self):
+        panel = ctk.CTkFrame(self, corner_radius=12)
+        self.batch_panel = panel
+        info = ctk.CTkLabel(panel, textvariable=self.batch_info_var, anchor="w")
+        info.pack(fill="x", padx=12, pady=(10, 0))
+        details = ctk.CTkLabel(panel, textvariable=self.batch_details_var, anchor="w")
+        details.pack(fill="x", padx=12, pady=(0, 6))
+
+        controls = ctk.CTkFrame(panel)
+        controls.pack(fill="x", padx=12, pady=(0, 10))
+
+        ctk.CTkButton(controls, text="Начать следующий", command=lambda: self._on_batch_action("next"), height=32).pack(side="left", padx=4)
+        ctk.CTkButton(controls, text="Печать пакета заново", command=lambda: self._on_batch_action("reprint"), height=32).pack(side="left", padx=4)
+        ctk.CTkButton(controls, text="Отменить дальнейшую печать", command=lambda: self._on_batch_action("cancel"), height=32).pack(side="left", padx=4)
+
+        partial = ctk.CTkFrame(panel)
+        partial.pack(fill="x", padx=12, pady=(0, 10))
+        ctk.CTkLabel(partial, text="Допечатать с номера внутри пакета:").pack(side="left", padx=4)
+        partial_entry = ctk.CTkEntry(partial, textvariable=self.batch_partial_var, width=120)
+        partial_entry.pack(side="left", padx=4)
+        ctk.CTkButton(partial, text="Допечатать часть", command=lambda: self._on_batch_action("partial"), height=32).pack(side="left", padx=4)
+
+        self._hide_batch_controls()
 
     def _start_bt(self):
         try:
@@ -1365,6 +1582,7 @@ class App(ctk.CTk):
         except Exception:
             pass
         self.cancel_requested = False
+        self._reset_batch_state()
         prn = self._get_printer()
 
         if not prn:
@@ -1395,7 +1613,7 @@ class App(ctk.CTk):
 
             return
 
-    
+
 
         limit = self._get_limit()
 
@@ -1410,7 +1628,7 @@ class App(ctk.CTk):
         global_start = idx0
         self.logger.log(f"Старт со строки: {global_start+1}")
 
-    
+
 
         # Сохраняем настройки
 
@@ -1426,563 +1644,56 @@ class App(ctk.CTk):
 
             pass
 
-    
+
 
         self.logger.log(f"Серия: {total}/{len(self.csv_rows)} строк; копий/шт={copies}; принтер='{prn}'; пакет={batch_size}; диалог={'ON' if self.show_dialog_var.get() else 'OFF'}")
 
         sent_total = 0
 
-    
+
 
         batches = [(i, min(i+batch_size, total)) for i in range(0, total, batch_size)]
 
         self.logger.log(f"Всего пакетов: {len(batches)}")
 
-    
-
         for bidx, (start, end) in enumerate(batches, start=1):
-
-    
-
-            # === PRECOMPUTE ENRICHED ROWS & WRITE tmp_batch.csv ===
-
-    
-
             rows = rows_all[start:end]
+            enriched_rows = self._prepare_enriched_rows(rows, global_start + start)
 
-    
-
-            enriched_rows = []
-
-    
-
-            formats_in_batch = set()
-
-    
-
-            for i_pre, base_pre in enumerate(rows):
-
-    
-
-                self._pause_wait()
-
-    
-
-                try:
-
-    
-
-                    self.update_idletasks(); self.update()
-
-    
-
-                except Exception:
-
-    
-
-                    pass
-
-    
-
-                idx1_pre = global_start + start + i_pre + 1
-
-    
-
-                enr_pre = self._enrich(base_pre, idx1_pre)
-
-    
-
-                if not enr_pre:
-
-    
-
-                    self.logger.err(f"Строка {idx1_pre}: данные не сформированы — пропуск в буфере")
-
-    
-
-                    continue
-
-    
-
-                enriched_rows.append(enr_pre)
-
-    
-
-                formats_in_batch.add(enr_pre.get("_FORMAT",""))
-            # === prepend 6 calibration rows in-memory (so they print as one job) ===
-            try:
-                if bool(self.calib_var.get()) and enriched_rows:
-                    cols = getattr(self, 'REQ_COLS', ["ShortName","ShortGTIN","EXP_DATE","PROD_DATE","PART_NUM","DM","NUM"])
-                    fmt0 = (enriched_rows[0].get("_FORMAT") or "16x16")
-                    dummy = {k: ("1" if k.upper()=="NUM" else ("000" if k=="ShortGTIN" else "X")) for k in cols}
-                    dummy.update({"_FORMAT": fmt0})
-                    enriched_rows = [dummy.copy() for _ in range(6)] + enriched_rows
-                    self.logger.log("КАЛИБРОВКА: 6 строк 'X' добавлены в начало батча.")
-            except Exception:
-                pass
-            # Показ диалога — ровно один раз перед первым ярлыком батча
-            prompt_left = bool(self.show_dialog_var.get())
-
-
-
-    
-
-            if enriched_rows:
-
-    
-
-                self._write_tmp_batch_csv(enriched_rows)
-
-    
-
-            else:
-
-    
-
+            if not enriched_rows:
                 self.logger.err(f"Пакет {bidx}: нет валидных строк для записи tmp_batch.csv — пропуск печати пакета")
-
-    
-
                 continue
 
-    
-
-            
-
-    
-
-            # === PRINT FROM enriched_rows ===
-
-    
-
-            fmt = None
-
-    
-
-            last_btw = None
-
-    
-
-            try:
-
-    
-
-                calib_done = False
-
-    
-
-                for i_enr, enr in enumerate(enriched_rows):
-
-    
-
-                    self._pause_wait()
-
-    
-
-                    try:
-
-    
-
-                        self.update_idletasks(); self.update()
-
-    
-
-                    except Exception:
-
-    
-
-                        pass
-
-    
-
-            
-
-    
-
-                    fmt_name = enr.get("_FORMAT","16x16")
-
-    
-
-                    btw = self._get_btw_for_format(fmt_name)
-
-    
-
-                    if not btw:
-
-    
-
-                        self.logger.err(f"Пакет {bidx}: BTW для формата {fmt_name} не указан — строка пропущена")
-
-    
-
-                        self._set_progress(i_enr+1, len(enriched_rows), f"Печать пакета {bidx}")
-
-    
-
-                        continue
-
-    
-
-            
-
-    
-
-                    if (fmt is None) or (btw != last_btw):
-
-    
-
-                        try:
-
-    
-
-                            if fmt:
-
-    
-
-                                fmt.Close(1)
-
-    
-
-                        except Exception:
-
-    
-
-                            pass
-
-    
-
-                        fmt = self.bt.open_format(btw)
-
-    
-
-                        self.bt.set_common_print_flags(fmt)
-
-    
-
-                        fmt.PrintSetup.Printer = prn
-
-    
-
-                        last_btw = btw
-
-    
-
-                        if not calib_done:
-
-    
-
-                            self._maybe_calibrate(fmt, copies)
-
-    
-
-                            calib_done = True
-
-    
-
-            
-
-    
-
-                    fmt.PrintSetup.IdenticalCopiesOfLabel = copies
-
-    
-
-                    ok = self.bt.apply_fields(fmt, enr)
-
-    
-
-                    if not ok:
-
-    
-
-                        self.logger.err(f"Пакет {bidx}: не удалось подставить значения — строка пропущена")
-
-    
-
-                        self._set_progress(i_enr+1, len(enriched_rows), f"Печать пакета {bidx}")
-
-    
-
-                        continue
-
-    
-
-            
-
-    
-
-                    self._bt_print(fmt, fmt.PrintSetup.IdenticalCopiesOfLabel, prompt_left)
-
-    
-
-                    prompt_left = False
-
-    
-
-            
-
-    
-
-                    sent_total += 1
-
-    
-
-                    if (sent_total % 50) == 0:
-
-    
-
-                        self.logger.log(f"Отправлено: {sent_total}/{total}")
-
-    
-
-            
-
-    
-
-                    self._set_progress(i_enr+1, len(enriched_rows), f"Печать пакета {bidx}")
-
-    
-
-            except Exception as e:
-
-    
-
-                import traceback
-
-    
-
-                self.logger.err(f"Сбой печати пакета {bidx} (после записи tmp_batch): {e}\n{traceback.format_exc()}")
-
-    
-
-            finally:
-
-    
-
-                try:
-
-    
-
-                    if fmt:
-
-    
-
-                        fmt.Close(1)
-
-    
-
-                except Exception:
-
-    
-
-                    pass
-
-    
-
-            # === END NEW BLOCK ===
-
-    
-
-            # --- Confirm next batch ---
-
-    
-
-            if bidx < len(batches):
-
-    
-
-                _go_next = True
-
-    
-
-                try:
-
-    
-
-                    _go_next = mb.askyesno("Печать следующего пакета?", f"Печать пакета {bidx} завершена. Печатать следующий?")
-
-    
-
-                except Exception:
-
-    
-
-                    pass
-
-    
-
-                if not _go_next:
-
-    
-
+            self._write_tmp_batch_csv(enriched_rows)
+            sent_total += self._print_enriched_rows(enriched_rows, prn, copies, bidx, len(batches))
+            self._store_batch_state(bidx, len(batches), rows, enriched_rows, global_start + start, copies, prn)
+            self._show_batch_controls(
+                f"Пакет {bidx}/{len(batches)} завершён", f"Строки: {global_start + start + 1}-{global_start + end} (в пакете {len(rows)} позиций)"
+            )
+
+            while True:
+                action = self._await_batch_action()
+                if action == "next":
                     break
-
-
-            prompt_left = bool(self.show_dialog_var.get())
-            rows = rows_all[start:end]
-
-            self.logger.log(f"[Пакет {bidx}/{len(batches)}] Строки {global_start+start+1}-{global_start+end} ({len(rows)} шт.)")
-
-            self._set_progress(0, len(rows), f"Печать пакета {bidx}")
-
-    
-
-            fmt = None
-
-            last_btw = None
-
-    
-
-            try:
-
-
-
-    
-
-                pass  # disabled original per-row loop
-                for i, base in enumerate(rows):
-                    self._pause_wait()
-                    try:
-                        self.update_idletasks()
-                        self.update()
-                    except Exception:
-                        pass
-                    idx1 = global_start + start + i + 1
-
-                    enr = self._enrich(base, idx1)
-
-                    if not enr:
-
-                        self.logger.err(f"Строка {idx1}: данные не сформированы — пропуск")
-
-                        self._set_progress(i+1, len(rows), f"Печать пакета {bidx}")
-
-                        continue
-
-    
-
-                    src = "manual" if self.format_combo.get() in ("16x16", "30x20") else "auto"
-
-                    self.logger.log(f"[P{bidx}] Строка {idx1}: формат {enr['_FORMAT']} (источник: {src}, комбо: {self.format_combo.get()}, GTIN={base.get('GTIN','')})")
-
-    
-
-                    fmt_name = enr["_FORMAT"]
-
-                    btw = self._get_btw_for_format(fmt_name)
-
-                    if not btw:
-
-                        self.logger.err(f"Строка {idx1}: BTW для формата {fmt_name} не указан — пропуск")
-
-                        self._set_progress(i+1, len(rows), f"Печать пакета {bidx}")
-
-                        continue
-
-    
-
-                    if (fmt is None) or (btw != last_btw):
-
-                        try:
-
-                            if fmt:
-
-                                fmt.Close(1)
-
-                        except Exception:
-
-                            pass
-
-                        fmt = self.bt.open_format(btw)
-
-                        self.bt.set_common_print_flags(fmt)
-
-                        fmt.PrintSetup.Printer = prn
-
-                        last_btw = btw
-
-    
-
-                        if not calib_done:
-
-                            self._maybe_calibrate(fmt, copies)
-
-                            calib_done = True
-
-    
-
-                    fmt.PrintSetup.IdenticalCopiesOfLabel = copies
-
-                    ok = self.bt.apply_fields(fmt, enr)
-
-                    if not ok:
-
-                        self.logger.err(f"Строка {idx1}: не удалось подставить значения — пропуск")
-
-                        self._set_progress(i+1, len(rows), f"Печать пакета {bidx}")
-
-                        continue
-
-    
-
-                    self._bt_print(fmt, fmt.PrintSetup.IdenticalCopiesOfLabel, prompt_left)
-                    prompt_left = False
-
-                    sent_total += 1
-
-                    if (sent_total % 50) == 0:
-
-                        self.logger.log(f"Отправлено: {sent_total}/{total}")
-
-    
-
-                    self._set_progress(i+1, len(rows), f"Печать пакета {bidx}")
-
-    
-
-            except Exception as e:
-
-                import traceback
-
-                self.logger.err(f"Сбой печати пакета {bidx}: {e}\n{traceback.format_exc()}")
-
-            finally:
-
-                try:
-
-                    if fmt:
-
-                        fmt.Close(1)
-
-                except Exception:
-
-                    pass
-
-    
-
-            if bidx < len(batches):
-
-                cont = mb.askyesno("Продолжить печать?", f"Пакет {bidx} завершён. Печатать следующий пакет ({bidx+1}/{len(batches)})?")
-
-                if not cont:
-
-                    self.logger.log("Печать остановлена по запросу пользователя.")
-
+                if action == "cancel":
+                    self.cancel_requested = True
                     break
+                if action == "reprint":
+                    self._reprint_current_batch()
+                    continue
+                if action == "partial":
+                    self._reprint_partial_batch()
+                    continue
+                break
 
-    
-
-        self._set_progress(total, total, "Печать")
-
+            if self.cancel_requested:
+                break
         self.logger.log(f"Готово. Отправлено: {sent_total}/{total}")
         # ## GUI_VIS_REVEAL_END ##
         try:
             self.deiconify(); self.state("normal"); self.lift()
         except Exception:
             pass
-
-
-    
 
     def _print_test(self):
         """Печать одной тестовой страницы (лучше калибровки 'X'). 
