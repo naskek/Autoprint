@@ -3711,7 +3711,8 @@ def _patch__print_range_one_job_via_csv(self):
             except Exception:
                 _tk = None; _mb = None
 
-            master_csv = os.path.join(BASE_DIR, "tmp_batch.csv")
+            # Используем тот же путь, что и при записи tmp_batch.csv, чтобы избежать несоответствий
+            master_csv = tmp_path
 
             def _get_pack_size():
                 cands = ["batch_entry", "pack_n", "pack_by", "packet_by", "packet_size", "pack_var"]
@@ -3727,9 +3728,15 @@ def _patch__print_range_one_job_via_csv(self):
 
             pack_size = _get_pack_size()
 
-            with open(master_csv, "r", encoding="utf-8-sig", newline="") as rf:
-                rdr = csv.reader(rf, delimiter=",", quotechar='"')
-                rows_all = list(rdr)
+            try:
+                with open(master_csv, "r", encoding="utf-8-sig", newline="") as rf:
+                    rdr = csv.reader(rf, delimiter=",", quotechar='"')
+                    rows_all = list(rdr)
+            except FileNotFoundError:
+                self.logger.err(f"tmp_batch.csv не найден: {master_csv}")
+                if _mb:
+                    _mb.showerror("tmp_batch.csv", f"Файл не найден:\n{master_csv}")
+                return
 
             if not rows_all:
                 self.logger.err("tmp_batch.csv пуст")
