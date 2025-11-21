@@ -43,6 +43,9 @@ from calendar import monthrange
 APP_TITLE    = "BarTender GUI V2.0 batch"
 APP_VERSION = "2.0"
 PREVIEW_NAME = "preview.png"
+AUTO_MARKING_ENABLED = True
+MARKING_PRINTER_NAME = "TSC TE210"
+MARKING_LABEL_TEMPLATE_PATH = os.path.join(BASE_DIR, "templates", "marking_label.btw")
 
 # ------------------------ Конфиг ------------------------
 
@@ -729,9 +732,26 @@ class App(ctk.CTk):
                     self.logger.log("Печать прервана пользователем.")
                     self.set_status("Печать отменена")
                     break
-                self._bt_print(fmt, fmt.PrintSetup.IdenticalCopiesOfLabel, prompt_left)
+                main_ok = self._bt_print(fmt, fmt.PrintSetup.IdenticalCopiesOfLabel, prompt_left)
                 prompt_left = False
-                sent += 1
+                if main_ok:
+                    sent += 1
+                    try:
+                        self.logger.log(f"Основная этикетка отправлена → '{prn}'.")
+                    except Exception:
+                        pass
+                    try:
+                        self._print_marking_label(enr)
+                    except Exception:
+                        try:
+                            self.logger.err("Авто-маркировка: внутренняя ошибка вызова.")
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        self.logger.err("Основная этикетка не отправлена: ошибка печати.")
+                    except Exception:
+                        pass
                 self._set_progress(i_enr+1, len(enriched_rows), f"Печать пакета {bidx}")
             return sent
         except Exception as e:
@@ -1380,7 +1400,84 @@ class App(ctk.CTk):
             pass
         return
 
-    
+
+    def _print_marking_label(self, enr):
+        if not AUTO_MARKING_ENABLED:
+            return
+        if not getattr(self, "bt", None):
+            try:
+                self.logger.err("Авто-маркировка: BarTender COM не инициализирован.")
+            except Exception:
+                pass
+            return
+        try:
+            prn = (MARKING_PRINTER_NAME or "").strip()
+        except Exception:
+            prn = ""
+        if not prn:
+            try:
+                self.logger.err("Авто-маркировка: принтер не задан (MARKING_PRINTER_NAME пуст).")
+            except Exception:
+                pass
+            return
+        template = MARKING_LABEL_TEMPLATE_PATH
+        if not template:
+            try:
+                self.logger.err("Авто-маркировка: путь к шаблону не указан (MARKING_LABEL_TEMPLATE_PATH).")
+            except Exception:
+                pass
+            return
+        try:
+            if not os.path.isabs(template):
+                template = os.path.join(BASE_DIR, template)
+        except Exception:
+            pass
+        if not os.path.isfile(template):
+            try:
+                self.logger.err(f"Авто-маркировка: шаблон не найден: {template}")
+            except Exception:
+                pass
+            return
+        fmt = None
+        try:
+            fmt = self.bt.open_format(template)
+            self.bt.set_common_print_flags(fmt)
+            try:
+                fmt.PrintSetup.Printer = prn
+            except Exception:
+                pass
+            try:
+                fmt.PrintSetup.PrinterName = prn
+            except Exception:
+                pass
+            try:
+                fmt.PrintSetup.IdenticalCopiesOfLabel = 1
+            except Exception:
+                pass
+            self.bt.apply_fields(fmt, enr)
+            ok = self._bt_print(fmt, 1, False)
+            if ok:
+                try:
+                    self.logger.log(f"Маркировочная этикетка отправлена → '{prn}'.")
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.logger.err(f"Авто-маркировка: печать не удалась на '{prn}'.")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.logger.err(f"Авто-маркировка: сбой печати: {e}")
+            except Exception:
+                pass
+        finally:
+            try:
+                fmt.Close(1)
+            except Exception:
+                pass
+
+
     def _bt_print(self, fmt, copies: int, show_dialog: bool):
 
         # Если выбран режим "Одно задание" — используем IdenticalCopiesOfLabel
@@ -1653,8 +1750,18 @@ class App(ctk.CTk):
             if not ok:
                 self.logger.err("Не удалось подставить значения (проверь имена полей в BTW).")
 
-            self._bt_print(fmt, fmt.PrintSetup.IdenticalCopiesOfLabel, False)
-            self.logger.log("Отправлено.")
+            main_ok = self._bt_print(fmt, fmt.PrintSetup.IdenticalCopiesOfLabel, False)
+            if main_ok:
+                self.logger.log(f"Основная этикетка отправлена → '{prn}'.")
+                try:
+                    self._print_marking_label(enr)
+                except Exception:
+                    try:
+                        self.logger.err("Авто-маркировка: внутренняя ошибка вызова.")
+                    except Exception:
+                        pass
+            else:
+                self.logger.err("Основная этикетка не отправлена: ошибка печати.")
         except Exception as e:
             self.logger.err(f"Сбой печати 1 шт: {e}\n{traceback.format_exc()}")
         finally:
