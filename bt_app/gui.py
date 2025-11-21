@@ -375,9 +375,11 @@ class Logger:
 
     def __init__(self, tb):
         self.tb = tb
+        # CTkTextbox проксирует не все методы Text, поэтому берём реальный текстовый виджет
+        self._text = getattr(tb, "_textbox", tb)
         try:
             for lvl, color in self.COLORS.items():
-                self.tb.tag_configure(lvl.lower(), foreground=color)
+                self._text.tag_configure(lvl.lower(), foreground=color)
         except Exception:
             pass
 
@@ -408,14 +410,17 @@ class Logger:
         lvl = self._detect_level(txt, level)
         ts = time.strftime("%H:%M:%S")
         tag = lvl.lower()
-        self.tb.configure(state="normal")
+        self._text.configure(state="normal")
         try:
-            self.tb.insert("end", f"[{ts}] {txt}\n", tag)
+            self._text.insert("end", f"[{ts}] {txt}\n", tag)
         except Exception:
-            self.tb.insert("end", f"[{ts}] {txt}\n")
-        self.tb.see("end")
-        self.tb.configure(state="normal")
-        self.tb.update_idletasks()
+            self._text.insert("end", f"[{ts}] {txt}\n")
+        self._text.see("end")
+        self._text.configure(state="normal")
+        try:
+            self._text.update_idletasks()
+        except Exception:
+            pass
 
     def log(self, msg):
         self._log(msg, "INFO")
