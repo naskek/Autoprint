@@ -9,6 +9,7 @@ BarTender GUI V0.3.3 FIX3k2
 
 import os, csv, re, time, json, atexit, traceback, datetime as dt
 import time
+import threading
 import customtkinter as ctk
 from tkinter import filedialog as fd, messagebox as mb, Menu
 from PIL import Image
@@ -491,6 +492,8 @@ class App(ctk.CTk):
         self.batch_partial_var = ctk.StringVar(value="")
         self._batch_panel_visible = False
 
+        self.status_var = ctk.StringVar(value="Готово")
+
         self._build_ui()
         self._start_bt()
         self._refresh_printers()
@@ -499,7 +502,7 @@ class App(ctk.CTk):
         self.after(200, self._prompt_csv_on_launch)
 
     # индикатор прогресса
-    
+
     def _set_progress(self, cur: int, total: int, phase: str = ""):
         try:
             if total <= 0:
@@ -516,6 +519,22 @@ class App(ctk.CTk):
                     pass
         except Exception:
             pass
+
+    def set_status(self, text: str):
+        def _apply():
+            try:
+                self.status_var.set(text)
+                self.update_idletasks()
+            except Exception:
+                pass
+
+        try:
+            if threading.current_thread() is threading.main_thread():
+                _apply()
+            else:
+                self.after(0, _apply)
+        except Exception:
+            _apply()
 
     # ---------- batch workflow helpers ----------
 
@@ -581,6 +600,8 @@ class App(ctk.CTk):
             "rows": list(rows),
             "enriched_rows": list(enriched_rows),
             "offset": global_offset,
+            "start_line": global_offset + 1,
+            "end_line": global_offset + len(rows),
             "copies": copies,
             "printer": printer,
         }
@@ -611,12 +632,16 @@ class App(ctk.CTk):
             pass
         return enriched_rows
 
-    def _print_enriched_rows(self, enriched_rows, prn: str, copies: int, bidx: int, total_batches: int) -> int:
+    def _print_enriched_rows(self, enriched_rows, prn: str, copies: int, bidx: int, total_batches: int, start_line: int | None = None, end_line: int | None = None) -> int:
         fmt = None
         last_btw = None
         sent = 0
         prompt_left = bool(self.show_dialog_var.get())
         calib_done = False
+        start_line = start_line if start_line is not None else 1
+        end_line = end_line if end_line is not None else (start_line + len(enriched_rows) - 1 if enriched_rows else start_line)
+        self.set_status(f"Печать пакета {bidx} из {total_batches} (строки {start_line}–{end_line})")
+        had_error = False
         try:
             for i_enr, enr in enumerate(enriched_rows):
                 self._pause_wait()
@@ -654,6 +679,7 @@ class App(ctk.CTk):
                     continue
                 if self.cancel_requested:
                     self.logger.log("Печать прервана пользователем.")
+                    self.set_status("Печать отменена")
                     break
                 self._bt_print(fmt, fmt.PrintSetup.IdenticalCopiesOfLabel, prompt_left)
                 prompt_left = False
@@ -663,6 +689,8 @@ class App(ctk.CTk):
         except Exception as e:
             import traceback
             self.logger.err(f"Сбой печати пакета {bidx} (после записи tmp_batch): {e}\n{traceback.format_exc()}")
+            self.set_status(f"Ошибка печати: {e}")
+            had_error = True
             return sent
         finally:
             try:
@@ -670,6 +698,10 @@ class App(ctk.CTk):
                     fmt.Close(1)
             except Exception:
                 pass
+            if self.cancel_requested:
+                self.set_status("Печать отменена")
+            elif not had_error:
+                self.set_status("Готово")
 
     def _reprint_current_batch(self):
         if not self.batch_info:
@@ -679,8 +711,11 @@ class App(ctk.CTk):
         if not enriched_rows:
             mb.showerror("Печать пакета", "Текущий пакет пуст и не может быть перепечатан.")
             return
+        self.set_status("Подготовка данных…")
         self._write_tmp_batch_csv(enriched_rows)
-        self._print_enriched_rows(enriched_rows, self.batch_info.get("printer", ""), self.batch_info.get("copies", 1), self.batch_info.get("index", 1), self.batch_info.get("total", 1))
+        start_line = self.batch_info.get("start_line", 1)
+        end_line = self.batch_info.get("end_line", start_line + len(enriched_rows) - 1)
+        self._print_enriched_rows(enriched_rows, self.batch_info.get("printer", ""), self.batch_info.get("copies", 1), self.batch_info.get("index", 1), self.batch_info.get("total", 1), start_line=start_line, end_line=end_line)
 
     def _reprint_partial_batch(self):
         if not self.batch_info:
@@ -693,12 +728,15 @@ class App(ctk.CTk):
             return
         offset = self.batch_info.get("offset", 0) + start_idx - 1
         part_rows = rows[start_idx - 1:]
+        self.set_status("Подготовка данных…")
         enriched_rows = self._prepare_enriched_rows(part_rows, offset)
         if not enriched_rows:
             mb.showerror("Допечатка", "Нет валидных строк для допечатки.")
             return
         self._write_tmp_batch_csv(enriched_rows)
-        self._print_enriched_rows(enriched_rows, self.batch_info.get("printer", ""), self.batch_info.get("copies", 1), self.batch_info.get("index", 1), self.batch_info.get("total", 1))
+        start_line = offset + 1
+        end_line = offset + len(part_rows)
+        self._print_enriched_rows(enriched_rows, self.batch_info.get("printer", ""), self.batch_info.get("copies", 1), self.batch_info.get("index", 1), self.batch_info.get("total", 1), start_line=start_line, end_line=end_line)
 
     def _build_ui(self):
         # верхняя панель: выбор формата/шаблонов/CSV
@@ -816,6 +854,8 @@ class App(ctk.CTk):
         self.progress_bar.set(0.0)
         self.progress_label = ctk.CTkLabel(pframe, text="Готово")
         self.progress_label.pack(anchor="w", padx=12, pady=(0, 8))
+        self.status_label = ctk.CTkLabel(pframe, textvariable=self.status_var)
+        self.status_label.pack(anchor="w", padx=12, pady=(0, 8))
 
         # низ: превью + лог
         bottom = ctk.CTkFrame(self, corner_radius=12)
@@ -1655,40 +1695,51 @@ class App(ctk.CTk):
         batches = [(i, min(i+batch_size, total)) for i in range(0, total, batch_size)]
 
         self.logger.log(f"Всего пакетов: {len(batches)}")
+        try:
+            for bidx, (start, end) in enumerate(batches, start=1):
+                rows = rows_all[start:end]
+                self.set_status("Подготовка данных…")
+                enriched_rows = self._prepare_enriched_rows(rows, global_start + start)
 
-        for bidx, (start, end) in enumerate(batches, start=1):
-            rows = rows_all[start:end]
-            enriched_rows = self._prepare_enriched_rows(rows, global_start + start)
-
-            if not enriched_rows:
-                self.logger.err(f"Пакет {bidx}: нет валидных строк для записи tmp_batch.csv — пропуск печати пакета")
-                continue
-
-            self._write_tmp_batch_csv(enriched_rows)
-            sent_total += self._print_enriched_rows(enriched_rows, prn, copies, bidx, len(batches))
-            self._store_batch_state(bidx, len(batches), rows, enriched_rows, global_start + start, copies, prn)
-            self._show_batch_controls(
-                f"Пакет {bidx}/{len(batches)} завершён", f"Строки: {global_start + start + 1}-{global_start + end} (в пакете {len(rows)} позиций)"
-            )
-
-            while True:
-                action = self._await_batch_action()
-                if action == "next":
-                    break
-                if action == "cancel":
-                    self.cancel_requested = True
-                    break
-                if action == "reprint":
-                    self._reprint_current_batch()
+                if not enriched_rows:
+                    self.logger.err(f"Пакет {bidx}: нет валидных строк для записи tmp_batch.csv — пропуск печати пакета")
                     continue
-                if action == "partial":
-                    self._reprint_partial_batch()
-                    continue
-                break
 
-            if self.cancel_requested:
-                break
-        self.logger.log(f"Готово. Отправлено: {sent_total}/{total}")
+                start_line = global_start + start + 1
+                end_line = global_start + end
+                self.set_status(f"Печать пакета {bidx} из {len(batches)} (строки {start_line}–{end_line})")
+                self._write_tmp_batch_csv(enriched_rows)
+                sent_total += self._print_enriched_rows(enriched_rows, prn, copies, bidx, len(batches), start_line=start_line, end_line=end_line)
+                self._store_batch_state(bidx, len(batches), rows, enriched_rows, global_start + start, copies, prn)
+                self._show_batch_controls(
+                    f"Пакет {bidx}/{len(batches)} завершён", f"Строки: {global_start + start + 1}-{global_start + end} (в пакете {len(rows)} позиций)"
+                )
+
+                while True:
+                    action = self._await_batch_action()
+                    if action == "next":
+                        break
+                    if action == "cancel":
+                        self.cancel_requested = True
+                        break
+                    if action == "reprint":
+                        self._reprint_current_batch()
+                        continue
+                    if action == "partial":
+                        self._reprint_partial_batch()
+                        continue
+                    break
+
+                if self.cancel_requested:
+                    break
+        except Exception as e:
+            self.set_status(f"Ошибка печати: {e}")
+            self.logger.err(f"Ошибка при печати пакетов: {e}")
+        if self.cancel_requested:
+            self.set_status("Печать отменена")
+        else:
+            self.logger.log(f"Готово. Отправлено: {sent_total}/{total}")
+            self.set_status("Готово")
         # ## GUI_VIS_REVEAL_END ##
         try:
             self.deiconify(); self.state("normal"); self.lift()
@@ -1771,6 +1822,7 @@ class App(ctk.CTk):
                     pass
             if getattr(self, "logger", None):
                 self.logger.log("Отмена печати: флаг установлен. Пытаюсь очистить очередь...")
+            self.set_status("Печать отменена")
         except Exception:
             pass
         try:
