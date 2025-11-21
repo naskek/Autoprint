@@ -1,0 +1,1 @@
+"""BarTender GUI application package."""
