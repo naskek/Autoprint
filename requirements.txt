@@ -1,0 +1,6 @@
+pyinstaller
+pywin32
+customtkinter
+pillow
+openpyxl
+tkcalendar
